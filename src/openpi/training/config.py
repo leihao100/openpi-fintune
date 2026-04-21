@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.ur3_policy as ur3_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -89,6 +90,12 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Local root directory for LeRobot datasets stored on disk.
+    # When set, LeRobotDataset loads from `local_root / repo_id` instead of
+    # downloading from HuggingFace Hub.  Useful during development when the
+    # dataset has not been uploaded yet.
+    local_root: pathlib.Path | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -461,6 +468,34 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotUR3DataConfig(DataConfigFactory):
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(ur3_policy.REPACK_STRUCTURE)]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[ur3_policy.UR3Inputs(model_type=model_config.model_type)],
+            outputs=[ur3_policy.UR3Outputs()],
+        )
+        # Actions are absolute joint positions → convert to delta for training.
+        # Gripper (last dim) stays absolute, hence -1 at the end.
+        delta_action_mask = _transforms.make_bool_mask(6, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
@@ -555,12 +590,105 @@ class TrainConfig:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
-
+#modify here lyh
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
     # Inference Aloha configs.
     #
+    TrainConfig(
+        name="pi0_ur3",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotUR3DataConfig(
+            # repo_id = folder name under local_root.
+            # Change this to the recording timestamp you want to train on.
+            repo_id="20260409_173023",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                # LeRobot dataset uses "action" (singular); this key is used
+                # by the data loader to build the action chunk before repack.
+                action_sequence_keys=("action",),
+                # Root directory that contains the recording folder.
+                # LeRobotDataset will load from local_root / repo_id.
+                local_root=pathlib.Path(
+                    "/home/ur3-exp/pi/ur3-neu-dev/recordings"
+                ),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=30000,
+        batch_size=32,
+        fsdp_devices=4, 
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_ur3",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotUR3DataConfig(
+            # repo_id = folder name under local_root.
+            # Change this to the recording timestamp you want to train on.
+            repo_id="20260420_165850",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                # LeRobot dataset uses "action" (singular); this key is used
+                # by the data loader to build the action chunk before repack.
+                action_sequence_keys=("action",),
+                # Root directory that contains the recording folder.
+                # LeRobotDataset will load from local_root / repo_id.
+                local_root=pathlib.Path(
+                    "/home/ur3-exp/pi/ur3-neu-dev/recordings"
+                ),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=3000,
+        batch_size=32,
+        fsdp_devices=4, 
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_ur3_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            max_token_len=32,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotUR3DataConfig(
+            # repo_id = folder name under local_root.
+            # Change this to the recording timestamp you want to train on.
+            repo_id="20260420_165850",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                # LeRobot dataset uses "action" (singular); this key is used
+                # by the data loader to build the action chunk before repack.
+                action_sequence_keys=("action",),
+                # Root directory that contains the recording folder.
+                # LeRobotDataset will load from local_root / repo_id.
+                local_root=pathlib.Path(
+                    "/home/ur3-exp/pi/ur3-neu-dev/recordings"
+                ),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=15000,
+        keep_period=1000,
+        batch_size=64,
+        fsdp_devices=4,
+        wandb_enabled=True,
+    ),
     TrainConfig(
         name="pi0_aloha",
         model=pi0_config.Pi0Config(),
