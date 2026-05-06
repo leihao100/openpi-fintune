@@ -306,18 +306,18 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # and then modify the mappings below so your dataset's keys get matched to those target keys.
         # The repack transform simply remaps key names here.
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
+          inputs=[
+            _transforms.RepackTransform(
+              {
+                "observation/image":       "observation.images.image",
+                "observation/wrist_image": "observation.images.wrist_image",
+                "observation/state":       "observation.state",
+                "actions":                 "actions",
+                "prompt":                  "prompt",
+              }
+            )
+        ]
+      )
 
         # The data transforms are applied to the data coming from the dataset *and* during inference.
         # Below, we define the transforms for data going into the model (``inputs``) and the transforms
@@ -360,6 +360,82 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotUR3MergedDataConfig(DataConfigFactory):
+    """UR3 merged dataset config. Same as LiberoDataConfig but with
+    correct column names for UR3 merged dataset (action singular,
+    observation.images.image / wrist_image)."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image":       "observation.images.fixed",
+                        "observation/wrist_image": "observation.images.cam_wrist",
+                        "observation/state":       "observation.state",
+                        "actions":                 "action",     # single to match dataset
+                        "prompt":                  "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),  # single
+        )
+
+        
+@dataclasses.dataclass(frozen=True)
+class OldLeRobotUR3MergedDataConfig(DataConfigFactory):
+    """UR3 merged dataset config. Same as LiberoDataConfig but with
+    correct column names for UR3 merged dataset (action singular,
+    observation.images.image / wrist_image)."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image":       "observation.images.fixed",
+                        "observation/wrist_image": "observation.images.cam_wrist",
+                        "observation/state":       "observation.state",
+                        "actions":                 "action",     # single to mathc dataset
+                        "prompt":                  "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),  # ← 单数，匹配数据集
+        )
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -597,98 +673,337 @@ _CONFIGS = [
     # Inference Aloha configs.
     #
     TrainConfig(
-        name="pi0_ur3",
-        model=pi0_config.Pi0Config(),
-        data=LeRobotUR3DataConfig(
-            # repo_id = folder name under local_root.
-            # Change this to the recording timestamp you want to train on.
-            repo_id="20260409_173023",
-            base_config=DataConfig(
-                prompt_from_task=True,
-                # LeRobot dataset uses "action" (singular); this key is used
-                # by the data loader to build the action chunk before repack.
-                action_sequence_keys=("action",),
-                # Root directory that contains the recording folder.
-                # LeRobotDataset will load from local_root / repo_id.
-                local_root=pathlib.Path(
-                    "/home/ur3-exp/pi/ur3-neu-dev/recordings"
-                ),
-            ),
+        name="pi05_libero_ur3",
+        #model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotLiberoDataConfig(
+            repo_id="/home/ur3-exp/pi/outcomes/tmp/ur3-pink-cylinder_6D_final/",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+#            assets=AssetsConfig(
+#              assets_dir="/home/ur3-exp/pi/openpi/assets",   # 本地目录
+#              asset_id="ur3_pick_place",                      # 自己起个名
+#    ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_base/params"
-        ),
-        num_train_steps=30000,
-        batch_size=32,
-        fsdp_devices=4, 
-        wandb_enabled=False,
-    ),
-    TrainConfig(
-        name="pi05_ur3",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            discrete_state_input=False,
-        ),
-        data=LeRobotUR3DataConfig(
-            # repo_id = folder name under local_root.
-            # Change this to the recording timestamp you want to train on.
-            repo_id="20260420_165850",
-            base_config=DataConfig(
-                prompt_from_task=True,
-                # LeRobot dataset uses "action" (singular); this key is used
-                # by the data loader to build the action chunk before repack.
-                action_sequence_keys=("action",),
-                # Root directory that contains the recording folder.
-                # LeRobotDataset will load from local_root / repo_id.
-                local_root=pathlib.Path(
-                    "/home/ur3-exp/pi/ur3-neu-dev/recordings"
-                ),
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
-        num_train_steps=3000,
-        batch_size=32,
-        fsdp_devices=4, 
-        wandb_enabled=False,
-    ),
-    TrainConfig(
-        name="pi05_ur3_lora",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            discrete_state_input=False,
-            max_token_len=32,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotUR3DataConfig(
-            # repo_id = folder name under local_root.
-            # Change this to the recording timestamp you want to train on.
-            repo_id="20260420_165850",
-            base_config=DataConfig(
-                prompt_from_task=True,
-                # LeRobot dataset uses "action" (singular); this key is used
-                # by the data loader to build the action chunk before repack.
-                action_sequence_keys=("action",),
-                # Root directory that contains the recording folder.
-                # LeRobotDataset will load from local_root / repo_id.
-                local_root=pathlib.Path(
-                    "/home/ur3-exp/pi/ur3-neu-dev/recordings"
-                ),
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
-        num_train_steps=15000,
-        keep_period=1000,
         batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=1500,
+        keep_period=250,
+        save_interval=250,
+    ),
+    
+    TrainConfig(
+     # This config is for fine-tuning pi05-base-mutitask on a custom multitask dataset.
+     # Here, we use LeRobot data format (like for all other fine-tuning examples)
+    name="pi05_ur3_multitask",
+    model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False, paligemma_variant="gemma_2b_lora", 
+                                action_expert_variant="gemma_300m_lora",),
+    data=LeRobotUR3MergedDataConfig(
+        repo_id="zestcode5/ur3-multiple-task",
+        base_config=DataConfig(
+            prompt_from_task=True,
+            # read from hub
+            ),
+        ),
+#    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+
+    batch_size=96,
+    num_train_steps=8000,
+    save_interval=1000,
+    log_interval=50,
+    keep_period=2000,
+    wandb_enabled=True,
+    freeze_filter=pi0_config.Pi0Config(pi05=True,paligemma_variant="gemma_2b_lora",action_expert_variant="gemma_300m_lora",
+    ).get_freeze_filter(),
+    ema_decay=None,
+    ),
+    
+    TrainConfig(
+    #  for test not train
+    # cp  ./assets/pi05_ur3_multitask → ./assets/pi0_5_multitask_old
+    name="pi0_5_multitask_old",
+    model=pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=10,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+    ),
+    data=OldLeRobotUR3MergedDataConfig(
+        repo_id="zestcode5/ur3-multiple-task-trimmed-idle",
+        base_config=DataConfig(
+            prompt_from_task=True,
+        ),
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader(
+        "gs://openpi-assets/checkpoints/pi05_base/params"
+    ),
+    # log from wandb
+    batch_size=96,
+    num_workers=2,
+    num_train_steps=8000,
+    save_interval=1000,
+    log_interval=50,
+    keep_period=2000,
+    fsdp_devices=1,
+    wandb_enabled=True,              
+    lr_schedule=_optimizer.CosineDecaySchedule(
+        warmup_steps=1_000,
+        peak_lr=2.5e-5,
+        decay_steps=30_000,
+        decay_lr=2.5e-6,
+    ),
+    optimizer=_optimizer.AdamW(
+        b1=0.9, b2=0.95, eps=1e-8,
+        weight_decay=1e-10,
+        clip_gradient_norm=1.0,
+    ),
+    freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+    ).get_freeze_filter(),
+    ema_decay=None,
+    ),
+    
+    
+    TrainConfig(
+        # T2 strategy: PaliGemma LoRA + Action Expert full fine-tuning.
+        # Addresses the dual-LoRA capacity bottleneck (loss plateau at ~0.011
+        # observed in pi05_ur3_multitask).
+        # Dataset: UR3 multitask, ~612k frames. Hardware: 4x A100 80G with FSDP.
+        name="pi05_ur3_multitask_full_action",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotUR3MergedDataConfig(
+            repo_id="zestcode5/ur3-merged-3tasks-v1",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                # read from hub
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        
+        batch_size=128,
+        num_workers=16,
+        num_train_steps=15000,
+        save_interval=250,
+        log_interval=10,
+        keep_period=1000,
         fsdp_devices=4,
         wandb_enabled=True,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-4,
+            clip_gradient_norm=1.0,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ).get_freeze_filter(),
+        ema_decay=0.99,
     ),
+    
+    TrainConfig(
+        # T2 strategy: PaliGemma LoRA + Action Expert full fine-tuning.
+        # Addresses the dual-LoRA capacity bottleneck (loss plateau at ~0.011
+        # observed in pi05_ur3_multitask).
+        # Dataset: UR3 multitask, ~612k frames. Hardware: 4x A100 80G with FSDP.
+        name="pi05_ur3_multitask_test_full_action",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotUR3MergedDataConfig(
+            repo_id="zestcode5/ur3-multiple-task-trimmed-idle",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                # read from hub
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        
+        batch_size=128,
+        num_workers=16,
+        num_train_steps=15000,
+        save_interval=250,
+        log_interval=10,
+        keep_period=1000,
+        fsdp_devices=4,
+        wandb_enabled=True,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-4,
+            clip_gradient_norm=1.0,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ).get_freeze_filter(),
+        ema_decay=0.99,
+    ),
+    TrainConfig(
+        # T2 strategy: PaliGemma LoRA + Action Expert full fine-tuning.
+        # Addresses the dual-LoRA capacity bottleneck (loss plateau at ~0.011
+        # observed in pi05_ur3_multitask).
+        # Dataset: UR3 multitask, ~612k frames. Hardware: 4x A100 80G with FSDP.
+        name="pi05_ur3_5task",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotUR3MergedDataConfig(
+            repo_id="zestcode5/ur3-merged-5tasks-v1",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                # read from hub
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        
+        batch_size=128,
+        num_workers=16,
+        num_train_steps=15000,
+        save_interval=250,
+        log_interval=10,
+        keep_period=1000,
+        fsdp_devices=4,
+        wandb_enabled=True,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-4,
+            clip_gradient_norm=1.0,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ).get_freeze_filter(),
+        ema_decay=0.99,
+    ),
+    
+    
+        TrainConfig(
+        # T2 strategy: PaliGemma LoRA + Action Expert full fine-tuning.
+        # Addresses the dual-LoRA capacity bottleneck (loss plateau at ~0.011
+        # observed in pi05_ur3_multitask).
+        # Dataset: UR3 multitask, ~612k frames. Hardware: 4x A100 80G with FSDP.
+        name="pi05_ur3_4task",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotUR3MergedDataConfig(
+            repo_id="zestcode5/ur3-merged-4tasks-v1",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                # read from hub
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        
+        batch_size=128,
+        num_workers=16,
+        num_train_steps=15000,
+        save_interval=250,
+        log_interval=10,
+        keep_period=1000,
+        fsdp_devices=4,
+        wandb_enabled=True,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-4,
+            clip_gradient_norm=1.0,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ).get_freeze_filter(),
+        ema_decay=0.99,
+    ),
+    
+    TrainConfig(
+     # This config is for fine-tuning pi05-base-mutitask on a custom multitask dataset.
+     # Here, we use LeRobot data format (like for all other fine-tuning examples)
+    name="pi05_ur3_push_glass",
+    model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False, paligemma_variant="gemma_2b_lora", 
+                                action_expert_variant="gemma_300m_lora",),
+    data=LeRobotUR3MergedDataConfig(
+        repo_id="poweredshine/ur3-single-finger-pushing-glass-to-marker",
+        base_config=DataConfig(
+            prompt_from_task=True,
+            # read from hub
+            ),
+        ),
+#    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+
+    batch_size=96,
+    num_train_steps=8000,
+    save_interval=1000,
+    log_interval=50,
+    keep_period=2000,
+    wandb_enabled=True,
+    freeze_filter=pi0_config.Pi0Config(pi05=True,paligemma_variant="gemma_2b_lora",action_expert_variant="gemma_300m_lora",
+    ).get_freeze_filter(),
+    ema_decay=None,
+    ),
+    
+    
     TrainConfig(
         name="pi0_aloha",
         model=pi0_config.Pi0Config(),
@@ -1044,6 +1359,8 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=32,
     ),
+    
+    
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
