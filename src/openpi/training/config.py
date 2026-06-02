@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.ur3_policy as ur3_policy
+import openpi.policies.unitree_policy as unitree_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -362,6 +363,42 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         )
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotUnitreeG1DataConfig(DataConfigFactory):
+    """Unitree G1 Dex1 bimanual dataset config.
+    16-DoF: L_arm(7) + R_arm(7) + L_grip(1) + R_grip(1).
+    Three cameras: left_high (base), left_wrist, right_wrist."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image":             "observation.images.cam_left_high",
+                        "observation/left_wrist_image":  "observation.images.cam_left_wrist",
+                        "observation/right_wrist_image": "observation.images.cam_right_wrist",
+                        "observation/state":             "observation.state",
+                        "actions":                       "action",   # single, matches dataset
+                        "prompt":                        "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[unitree_policy.UnitreeG1Inputs(model_type=model_config.model_type)],
+            outputs=[unitree_policy.UnitreeG1Outputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),   # single
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotUR3MergedDataConfig(DataConfigFactory):
     """UR3 merged dataset config. Same as LiberoDataConfig but with
     correct column names for UR3 merged dataset (action singular,
@@ -694,6 +731,55 @@ _CONFIGS = [
         num_train_steps=1500,
         keep_period=250,
         save_interval=250,
+    ),
+    
+    TrainConfig(
+    # Unitree G1 Dex1 bimanual pick-and-place, 16-DoF.
+    # T2 strategy: PaliGemma LoRA + Action Expert full fine-tuning.
+    # Small dataset (~20k frames, 50 eps) → smaller bs, fewer steps than UR3 5task.
+      name="pi05_unitree_g1",
+      model=pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=10,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ),
+      data=LeRobotUnitreeG1DataConfig(
+        repo_id="/home/ur3-exp/pi/outcomes/unitree-pick-red-bottle",  # ← fill in
+        base_config=DataConfig(
+            prompt_from_task=True,
+        ),
+      ),
+      weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+
+      batch_size=64,
+      num_workers=8,
+      num_train_steps=8000,
+      save_interval=250,
+      log_interval=10,
+      keep_period=1000,
+      fsdp_devices=4,
+      wandb_enabled=True,
+      lr_schedule=_optimizer.CosineDecaySchedule(
+        warmup_steps=500,
+        peak_lr=2.5e-5,
+        decay_steps=15_000,
+        decay_lr=2.5e-6,
+      ),
+      optimizer=_optimizer.AdamW(
+        b1=0.9,
+        b2=0.95,
+        eps=1e-8,
+        weight_decay=1e-4,
+        clip_gradient_norm=1.0,
+      ),
+      freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ).get_freeze_filter(),
+      ema_decay=0.99,
     ),
     
     TrainConfig(
