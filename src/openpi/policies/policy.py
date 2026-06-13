@@ -103,6 +103,37 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        # VRAM telemetry (JAX path only), reported to the client for logging.
+        # Fully guarded: any failure is a no-op and never affects inference.
+        if not self._is_pytorch_model:
+            try:
+                import jax as _jax
+                _ms = _jax.local_devices()[0].memory_stats() or {}
+                _pt = outputs["policy_timing"]
+                if "peak_bytes_in_use" in _ms:
+                    _pt["vram_peak_gb"] = _ms["peak_bytes_in_use"] / 1e9
+                if "bytes_in_use" in _ms:
+                    _pt["vram_now_gb"] = _ms["bytes_in_use"] / 1e9
+                if "bytes_reserved" in _ms:
+                    _pt["vram_reserved_gb"] = _ms["bytes_reserved"] / 1e9
+                if "bytes_limit" in _ms:
+                    _pt["vram_limit_gb"] = _ms["bytes_limit"] / 1e9
+                if not hasattr(self, "_param_bytes"):
+                    try:
+                        from flax import nnx as _nnx
+                        _leaves = _jax.tree_util.tree_leaves(_nnx.state(self._model, _nnx.Param))
+                        self._param_bytes = int(sum(
+                            int(x.size) * x.dtype.itemsize
+                            for x in _leaves if hasattr(x, "size") and hasattr(x, "dtype")))
+                    except Exception:
+                        self._param_bytes = None
+                if self._param_bytes:
+                    _pt["vram_params_gb"] = self._param_bytes / 1e9
+                    if "vram_peak_gb" in _pt:
+                        _pt["vram_activations_gb"] = max(
+                            0.0, _pt["vram_peak_gb"] - self._param_bytes / 1e9)
+            except Exception:
+                pass
         return outputs
 
     @property

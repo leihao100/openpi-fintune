@@ -1,5 +1,31 @@
+import io
+
 import numpy as np
 from PIL import Image
+
+
+def _maybe_decode_encoded(images: np.ndarray) -> np.ndarray:
+    """Decode images that arrived as encoded bytes (e.g. JPEG/PNG) instead of raw arrays.
+
+    Some clients send compressed image bytes over the wire to save bandwidth. msgpack
+    carries those as a numpy array with a bytes/str/object dtype (e.g. ``|S74063``) rather
+    than a ``uint8`` H×W×C array. Decode them back here so the rest of the resize path can
+    treat every image uniformly. Arrays that are already numeric are returned unchanged.
+    """
+    if images.dtype.kind not in ("S", "U", "O"):
+        return images
+
+    flat = images.reshape(-1)
+    decoded = []
+    for item in flat:
+        if isinstance(item, np.ndarray):
+            item = item.item()
+        if isinstance(item, str):
+            item = item.encode("latin-1")
+        decoded.append(np.asarray(Image.open(io.BytesIO(item)).convert("RGB")))
+    decoded = np.stack(decoded)
+    # Drop the scalar element axis and restore any leading (batch) dims.
+    return decoded.reshape(*images.shape, *decoded.shape[1:])
 
 
 def convert_to_uint8(img: np.ndarray) -> np.ndarray:
@@ -24,6 +50,9 @@ def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BI
     Returns:
         The resized images in [..., height, width, channel].
     """
+    # Decode encoded byte blobs (e.g. JPEG/PNG) into raw uint8 arrays first.
+    images = _maybe_decode_encoded(images)
+
     # If the images are already the correct size, return them as is.
     if images.shape[-3:-1] == (height, width):
         return images

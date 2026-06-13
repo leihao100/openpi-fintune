@@ -47,6 +47,87 @@ from openpi.training import utils
 import openpi.training.config as _config
 
 
+def _fold_lora_into_base_weights(
+    state_dict: dict,
+    paligemma_variant: str,
+    action_expert_variant: str,
+) -> None:
+    """In-place: merge OpenPI JAX LoRA adapters into their base weights.
+
+    OpenPI's JAX LoRA (``openpi/models/lora.py``) keeps the base param ``w`` frozen and stores the
+    trained delta in two extra params ``lora_a`` and ``lora_b``. JAX recomputes ``w + scaling * (lora_a @ lora_b)``
+    on every forward; the PyTorch model has no LoRA support, so without folding here the trained
+    adapters are silently dropped and the converted checkpoint reverts to base weights.
+
+    Two LoRA storage shapes need handling:
+      * ``lora.Einsum`` (q_einsum / kv_einsum / attn_vec_einsum):
+          siblings ``<module>/lora_a`` and ``<module>/lora_b`` of base ``<module>/w``.
+      * ``lora.FeedForward`` (mlp gating + linear):
+          siblings ``<module>/<name>_lora_a`` and ``<module>/<name>_lora_b`` of base ``<module>/<name>``,
+          where ``<name>`` is ``gating_einsum`` or ``linear``.
+
+    Both use ``axes=(-2, -1)`` so the merge contracts over the rank axis: last axis of A,
+    second-to-last of B. The leading dims (layer, head, …) batch through the einsum.
+
+    No-op when the checkpoint contains no ``*lora_a`` keys (full fine-tunes / base models).
+    """
+    suffix = "/value" if "img/embedding/kernel/value" in state_dict else ""
+
+    pali_cfg = openpi.models.gemma.get_config(paligemma_variant)
+    expert_cfg = openpi.models.gemma.get_config(action_expert_variant)
+
+    def _scaling_for(key: str) -> float:
+        segments = key.split("/")
+        is_expert = any(seg.endswith("_1") for seg in segments)
+        is_ffn = "mlp" in segments or "mlp_1" in segments
+        cfg = expert_cfg if is_expert else pali_cfg
+        kind = "ffn" if is_ffn else "attn"
+        lora_cfg = cfg.lora_configs.get(kind)
+        if lora_cfg is None:
+            variant = action_expert_variant if is_expert else paligemma_variant
+            raise ValueError(
+                f"Found LoRA tensor {key!r} but variant {variant!r} has no LoRA config for {kind}. "
+                f"Likely a config/checkpoint mismatch."
+            )
+        return lora_cfg.scaling_value
+
+    n_merged = 0
+    for key in list(state_dict.keys()):
+        if key.endswith(f"/lora_a{suffix}"):
+            base_prefix = key[: -len(f"/lora_a{suffix}")]
+            base_key = f"{base_prefix}/w{suffix}"
+            lora_b_key = f"{base_prefix}/lora_b{suffix}"
+        elif key.endswith(f"_lora_a{suffix}"):
+            base_prefix = key[: -len(f"_lora_a{suffix}")]
+            base_key = f"{base_prefix}{suffix}"
+            lora_b_key = f"{base_prefix}_lora_b{suffix}"
+        else:
+            continue
+
+        if base_key not in state_dict or lora_b_key not in state_dict:
+            raise KeyError(
+                f"LoRA tensor {key!r} is missing siblings — expected base {base_key!r} "
+                f"and {lora_b_key!r} in checkpoint."
+            )
+
+        scaling = _scaling_for(key)
+        lora_a = np.asarray(state_dict[key])
+        lora_b = np.asarray(state_dict[lora_b_key])
+        delta = np.einsum("...dr,...rh->...dh", lora_a, lora_b)
+        base = np.asarray(state_dict[base_key])
+        state_dict[base_key] = (base + scaling * delta).astype(base.dtype)
+
+        del state_dict[key]
+        del state_dict[lora_b_key]
+        n_merged += 1
+
+    if n_merged > 0:
+        print(
+            f"  Merged {n_merged} LoRA adapter pairs into base weights "
+            f"(paligemma={paligemma_variant!r}, action_expert={action_expert_variant!r})."
+        )
+
+
 def slice_paligemma_state_dict(state_dict, config):
     """Convert PaliGemma JAX parameters to PyTorch format."""
     suffix = "/value" if "img/embedding/kernel/value" in state_dict else ""
@@ -290,7 +371,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     llm_mlp_linear = state_dict.pop(f"llm/layers/mlp_{num_expert}/linear{suffix}")
 
     # Check if we have Dense layers (for pi05/adaptive normalization) or scale layers (for regular pi0)
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization
         llm_input_layernorm_bias = state_dict.pop(f"llm/layers/pre_attention_norm_{num_expert}/Dense_0/bias{suffix}")
         llm_post_attention_layernorm_bias = state_dict.pop(f"llm/layers/pre_ffw_norm_{num_expert}/Dense_0/bias{suffix}")
@@ -345,7 +426,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             i
         ].transpose()
 
-        if "pi05" in checkpoint_dir:
+        if pi05:
             # Pi05 with adaptive normalization - use Dense layer parameters directly
             state_dict[f"paligemma_with_expert.gemma_expert.model.layers.{i}.input_layernorm.dense.bias"] = (
                 llm_input_layernorm_bias[i]
@@ -369,7 +450,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             )
 
     # Handle final norm layer
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization - use Dense layer parameters directly
         final_norm_bias = state_dict.pop(f"llm/final_norm_{num_expert}/Dense_0/bias{suffix}")
         final_norm_kernel = state_dict.pop(f"llm/final_norm_{num_expert}/Dense_0/kernel{suffix}")
@@ -436,6 +517,25 @@ def convert_pi0_checkpoint(
 
     # Break down orbax ckpts by restoring via JAX to respect dtype
     initial_params = slice_initial_orbax_checkpoint(checkpoint_dir=checkpoint_dir, restore_precision="float32")
+
+    # Fold any JAX LoRA adapters (lora_a/lora_b) into their base `w` so the downstream PyTorch
+    # path — which has no LoRA support — sees the fully fine-tuned weights. No-op for full fine-tunes.
+    # Set OPENPI_SKIP_LORA_FOLD=1 to skip (diagnostic: produces the pre-fix behaviour where LoRA
+    # adapters are silently dropped).
+    if os.environ.get("OPENPI_SKIP_LORA_FOLD") == "1":
+        # Strip lora_a/lora_b keys without merging, so slice_paligemma_state_dict doesn't see them.
+        suffix = "/value" if "img/embedding/kernel/value" in initial_params["paligemma_params"] else ""
+        for k in list(initial_params["paligemma_params"].keys()):
+            if k.endswith(f"/lora_a{suffix}") or k.endswith(f"_lora_a{suffix}") \
+               or k.endswith(f"/lora_b{suffix}") or k.endswith(f"_lora_b{suffix}"):
+                del initial_params["paligemma_params"][k]
+        print("  [DIAG] LoRA fold skipped (OPENPI_SKIP_LORA_FOLD=1); LoRA adapters stripped, base weights only.")
+    else:
+        _fold_lora_into_base_weights(
+            initial_params["paligemma_params"],
+            paligemma_variant=model_config.paligemma_variant,
+            action_expert_variant=model_config.action_expert_variant,
+        )
 
     # Process projection params
     if model_config.pi05:

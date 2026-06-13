@@ -10,15 +10,29 @@ Dataset: LeRobot v2.1, Unitree_G1_Dex1_Sim
 import dataclasses
 import einops
 import numpy as np
+import cv2
 
 from openpi import transforms
 from openpi.models import model as _model
 
 
 def _parse_image(image) -> np.ndarray:
-    """Convert image to uint8 HWC. Handles both float32 CHW [0,1] (LeRobot
-    video decode) and uint8 HWC (live inference)."""
+    """Convert image to uint8 HWC. Handles:
+      - JPEG-encoded bytes (client --send-jpeg): cv2.imdecode (-> BGR) then
+        BGR->RGB, matching the client's native-BGR JPEG encode contract.
+      - float32 CHW [0,1] (LeRobot video decode).
+      - uint8 HWC (live inference, already-decoded RGB)."""
+    # --send-jpeg path: client ships compressed JPEG bytes to cut upload ~12x.
+    if isinstance(image, (bytes, bytearray, memoryview)):
+        buf = np.frombuffer(bytes(image), dtype=np.uint8)
+        bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     image = np.asarray(image)
+    # JPEG bytes that arrived as a 1-D uint8 array (JPEG SOI marker 0xFFD8).
+    if (image.ndim == 1 and image.dtype == np.uint8 and image.size > 2
+            and image[0] == 0xFF and image[1] == 0xD8):
+        bgr = cv2.imdecode(image, cv2.IMREAD_COLOR)
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     if np.issubdtype(image.dtype, np.floating):
         image = (255 * image).astype(np.uint8)
     if image.ndim == 3 and image.shape[0] == 3:

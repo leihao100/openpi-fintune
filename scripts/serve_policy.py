@@ -9,7 +9,7 @@ from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
-
+import openpi.transforms as transforms
 
 class EnvMode(enum.Enum):
     """Supported environments."""
@@ -89,12 +89,29 @@ def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
+            train_config = _config.get_config(args.policy.config)
+            data_config = train_config.data.create(
+                train_config.assets_dirs, train_config.model)
+
+            # Serving has no ground-truth action; drop the "actions<-action" mapping
+            # so RepackTransform doesn't look for a key the client never sends.
+            repack = data_config.repack_transforms
+            infer_repack = transforms.Group(
+                inputs=[
+                    transforms.RepackTransform({
+                        k: v for k, v in t.structure.items() if k != "actions"
+                    }) if isinstance(t, transforms.RepackTransform) else t
+                    for t in repack.inputs
+                ],
+                outputs=repack.outputs,
+            )
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                train_config, args.policy.dir,
+                repack_transforms=infer_repack,
+                default_prompt=args.default_prompt,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
-
 
 def main(args: Args) -> None:
     policy = create_policy(args)
