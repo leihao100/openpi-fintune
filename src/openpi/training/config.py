@@ -682,6 +682,18 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
+    # --- Periodic open-loop eval (used by scripts/train_eval.py) ---
+    # How often (in steps) to run eval. 0 disables eval.
+    eval_interval: int = 0
+    # Number of episodes (from the start of the dataset) to evaluate.
+    eval_episodes: int = 1
+    # Evaluate every Nth frame within an episode.
+    eval_stride: int = 1
+    # Optional cap on the number of frames evaluated per episode.
+    eval_max_frames: int | None = None
+    # Dataset directory for eval. If None, uses the training dataset.
+    eval_data_path: str | None = None
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
@@ -740,26 +752,28 @@ _CONFIGS = [
       name="pi05_unitree_g1",
       model=pi0_config.Pi0Config(
         pi05=True,
-        action_horizon=10,
+        action_horizon=32,
         discrete_state_input=False,
         paligemma_variant="gemma_2b_lora",
         action_expert_variant="gemma_300m",
       ),
       data=LeRobotUnitreeG1DataConfig(
-        repo_id="/home/ur3-exp/pi/outcomes/unitree-pick-red-bottle",  # ← fill in
+        repo_id="put_cup_n_broccoli",
         base_config=DataConfig(
+            local_root=pathlib.Path("/home/bioprocessing-lab/yuhao/data"),
             prompt_from_task=True,
         ),
       ),
       weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
 
-      batch_size=64,
+      batch_size=32,
       num_workers=8,
-      num_train_steps=8000,
-      save_interval=250,
-      log_interval=10,
-      keep_period=1000,
-      fsdp_devices=4,
+      num_train_steps=20000,
+      save_interval=2000,
+      log_interval=100,
+    #   keep_last=3,
+      keep_period=2000,
+    #   fsdp_devices=4,
       wandb_enabled=True,
       lr_schedule=_optimizer.CosineDecaySchedule(
         warmup_steps=500,
@@ -780,7 +794,19 @@ _CONFIGS = [
         action_expert_variant="gemma_300m",
       ).get_freeze_filter(),
       ema_decay=0.99,
+          # How often (in steps) to run eval. 0 disables eval.
+    eval_interval = 500,
+    # Number of episodes (from the start of the dataset) to evaluate.
+    eval_episodes = 5,
+    # Evaluate every Nth frame within an episode.
+    eval_stride= 20,
+    # Optional cap on the number of frames evaluated per episode.
+    eval_max_frames = None,
+    # Dataset directory for eval. If None, uses the training dataset.
+    eval_data_path = "/home/bioprocessing-lab/yuhao/data/put_cup_n_broccoli_eval",
+      
     ),
+
     
     TrainConfig(
      # This config is for fine-tuning pi05-base-mutitask on a custom multitask dataset.
