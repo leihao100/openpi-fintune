@@ -1,5 +1,9 @@
 # Data directories.
 assets/
+# ...but keep the G1 URDF/meshes vendored for scripts/joint_to_eef.py
+!scripts/assets/
+!scripts/assets/g1/
+!scripts/assets/g1/**
 checkpoints/
 data/
 wandb/

@@ -26,8 +26,12 @@ import numpy as np
 import pandas as pd
 import pinocchio as pin
 
-DEFAULT_URDF = "/home/ur3-exp/unitree/xr_teleoperate/assets/g1/g1_body29_hand14.urdf"
-DEFAULT_ASSETS = "/home/ur3-exp/unitree/xr_teleoperate/assets/g1/"
+# Vendored G1 URDF + meshes live next to this script (scripts/assets/g1/), copied
+# from xr_teleoperate's assets so the converter is self-contained. Override with
+# --urdf / --assets to use a different robot description.
+_ASSETS_G1 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "g1")
+DEFAULT_URDF = os.path.join(_ASSETS_G1, "g1_body29_hand14.urdf")
+DEFAULT_ASSETS = _ASSETS_G1
 EE_OFFSET = 0.05  # meters, along x of the wrist yaw frame (same as G1_29_ArmIK)
 
 # Dataset column order (G1_29_JointArmIndex) -> URDF joint names
