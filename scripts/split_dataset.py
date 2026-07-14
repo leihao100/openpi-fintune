@@ -7,6 +7,11 @@ Example:
         --eval_dir /home/bioprocessing-lab/yuhao/data/put_cup_n_broccoli_eval \
         --num 5 --seed 0
 
+    uv run scripts/split_dataset.py \
+        --src ~/unitree/data/sort-tools-eef \
+        --eval_dir ~/unitree/data/sort-tools-eef-eval \
+        --num 5 --seed 0  --move 
+
 By default the source is left untouched (eval episodes still exist in train).
 Pass --move to also remove the selected episodes from the source, re-indexing it
 in place, so the eval set becomes a true held-out split.

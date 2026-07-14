@@ -316,10 +316,9 @@ def run_eval(config, data_config, state, dataset, prompt_fn, action_key, specs, 
             abs_sum += np.abs(err).sum()
             sq_sum += np.square(err).sum()
             count += err.size
-            if e == specs[0][0]:
-                metrics["eval/actions"] = wandb.Image(
-                    _actions_fig(demo, pred, np.asarray(idxs) - start, config.name, e)
-                )
+            metrics[f"eval/actions_ep{e}"] = wandb.Image(
+                _actions_fig(demo, pred, np.asarray(idxs) - start, config.name, e)
+            )
     metrics["eval/mae"] = float(abs_sum / count)
     metrics["eval/mse"] = float(sq_sum / count)
     del policy

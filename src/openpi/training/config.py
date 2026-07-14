@@ -22,6 +22,8 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.ur3_policy as ur3_policy
 import openpi.policies.unitree_policy as unitree_policy
+import openpi.policies.unitree_eef_policy as unitree_eef_policy
+import openpi.policies.unitree_eef6d_policy as unitree_eef6d_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -399,6 +401,106 @@ class LeRobotUnitreeG1DataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotUnitreeG1EEFDataConfig(DataConfigFactory):
+    """Unitree G1 Dex1 bimanual EEF-space dataset config.
+    16-dim: L_eef xyz+quat(7) + R_eef xyz+quat(7) + L_grip(1) + R_grip(1),
+    pelvis frame, quaternion order (qx, qy, qz, qw).
+    Three cameras: left_high (base), left_wrist, right_wrist."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image":             "observation.images.cam_left_high",
+                        "observation/left_wrist_image":  "observation.images.cam_left_wrist",
+                        "observation/right_wrist_image": "observation.images.cam_right_wrist",
+                        "observation/state":             "observation.state",
+                        "actions":                       "action",   # single, matches dataset
+                        "prompt":                        "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[unitree_eef_policy.UnitreeG1EEFInputs(model_type=model_config.model_type)],
+            outputs=[unitree_eef_policy.UnitreeG1EEFOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),   # single
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotUnitreeG1EEF6DDataConfig(DataConfigFactory):
+    """Unitree G1 Dex1 bimanual EEF-space dataset config, 6D rotation action space.
+
+    On disk the dataset is the same 16-dim quaternion layout as
+    LeRobotUnitreeG1EEFDataConfig (L/R xyz+quat + grippers, pelvis frame). The
+    data transform converts quat->6D on the way into the model (state + actions,
+    so norm_stats are computed on the 20-dim 6D representation) and 6D->quat on
+    the way out, so the on-robot client contract stays 16-dim quaternion.
+
+    If `delta_position_actions` is True, the two EEF POSITION triplets (dims
+    0:3 and 9:12 of the 20-dim 6D layout) are converted to deltas relative to
+    the current state before the model, and added back after. Rotations (6D)
+    and grippers stay absolute. This makes the trajectory largely independent
+    of the robot's absolute standing pose / object position and is the
+    single most effective change for spatial generalization when collection and
+    deployment are NOT at fixed positions (see UMI / action-space studies).
+    The on-robot client contract is unchanged: AbsoluteActions re-adds the
+    current EEF pose, so the client still receives absolute quaternion poses."""
+
+    # Convert the L/R EEF position triplets to delta actions (rotations/grippers
+    # stay absolute). Requires its own norm_stats (delta action distribution
+    # differs from absolute), so use a distinct config name / assets dir.
+    delta_position_actions: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image":             "observation.images.cam_left_high",
+                        "observation/left_wrist_image":  "observation.images.cam_left_wrist",
+                        "observation/right_wrist_image": "observation.images.cam_right_wrist",
+                        "observation/state":             "observation.state",
+                        "actions":                       "action",   # single, matches dataset
+                        "prompt":                        "prompt",
+                    }
+                )
+            ]
+        )
+        input_transforms = [unitree_eef6d_policy.UnitreeG1EEF6DInputs(model_type=model_config.model_type)]
+        output_transforms = [unitree_eef6d_policy.UnitreeG1EEF6DOutputs()]
+        if self.delta_position_actions:
+            # 20-dim 6D layout: [Lpos(3) | Lrot6d(6) | Rpos(3) | Rrot6d(6) | Lgrip | Rgrip].
+            # Delta only the two position triplets; rotation-6D and grippers absolute.
+            pos_delta_mask = _transforms.make_bool_mask(3, -6, 3, -6, -2)
+            # DeltaActions runs AFTER the quat->6D input transform (needs the 20-dim
+            # state+actions); AbsoluteActions runs BEFORE the 6D->quat output transform
+            # (must act on the 20-dim layout the mask indexes).
+            input_transforms.append(_transforms.DeltaActions(pos_delta_mask))
+            output_transforms.insert(0, _transforms.AbsoluteActions(pos_delta_mask))
+        data_transforms = _transforms.Group(inputs=input_transforms, outputs=output_transforms)
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),   # single
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotUR3MergedDataConfig(DataConfigFactory):
     """UR3 merged dataset config. Same as LiberoDataConfig but with
     correct column names for UR3 merged dataset (action singular,
@@ -758,9 +860,9 @@ _CONFIGS = [
         action_expert_variant="gemma_300m",
       ),
       data=LeRobotUnitreeG1DataConfig(
-        repo_id="put_cup_n_broccoli",
+        repo_id="stack-cube-new",
         base_config=DataConfig(
-            local_root=pathlib.Path("/home/bioprocessing-lab/yuhao/data"),
+            local_root=pathlib.Path("/home/ur3-exp/unitree/data"),
             prompt_from_task=True,
         ),
       ),
@@ -769,7 +871,7 @@ _CONFIGS = [
       batch_size=32,
       num_workers=8,
       num_train_steps=20000,
-      save_interval=2000,
+      save_interval=4000,
       log_interval=100,
     #   keep_last=3,
       keep_period=2000,
@@ -803,11 +905,293 @@ _CONFIGS = [
     # Optional cap on the number of frames evaluated per episode.
     eval_max_frames = None,
     # Dataset directory for eval. If None, uses the training dataset.
-    eval_data_path = "/home/bioprocessing-lab/yuhao/data/put_cup_n_broccoli_eval",
-      
+    eval_data_path = "/home/ur3-exp/unitree/data/stack-cube-new-eval",
+
     ),
 
-    
+    TrainConfig(
+    # Unitree G1 Dex1 bimanual pick-and-place, EEF action space.
+    # Same recipe as pi05_unitree_g1 but state/action are EEF poses
+    # (L/R xyz+quat + grippers, 16-dim) converted by ~/unitree/data/joint_to_eef.py.
+    # T2 strategy: PaliGemma LoRA + Action Expert full fine-tuning.
+      name="pi05_g1_eef",
+      model=pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=48,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ),
+      data=LeRobotUnitreeG1EEFDataConfig(
+        repo_id="sort-tools-eef",
+        base_config=DataConfig(
+            local_root=pathlib.Path("/home/ur3-exp/unitree/data"),
+            prompt_from_task=True,
+        ),
+      ),
+      weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    #   weight_loader=weight_loaders.CheckpointWeightLoader("/home/ur3-exp/pi/openpi/checkpoints/pi05_g1_eef/eef_v1/19999/params"),
+      batch_size=32,
+      num_workers=8,
+      num_train_steps=20000,
+      save_interval=4000,
+      log_interval=100,
+      keep_period=2000,
+      wandb_enabled=True,
+      lr_schedule=_optimizer.CosineDecaySchedule(
+        warmup_steps=500,
+        peak_lr=2.5e-5,
+        decay_steps=15_000,
+        decay_lr=2.5e-6,
+      ),
+      optimizer=_optimizer.AdamW(
+        b1=0.9,
+        b2=0.95,
+        eps=1e-8,
+        weight_decay=1e-4,
+        clip_gradient_norm=1.0,
+      ),
+      freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ).get_freeze_filter(),
+      ema_decay=0.99,
+      eval_interval = 500,
+      eval_episodes = 5,
+      eval_stride= 20,
+      eval_max_frames = None,
+      eval_data_path = "/home/ur3-exp/unitree/data/sort-tools-eef-eval",
+    ),
+
+    TrainConfig(
+    # Unitree G1 Dex1 bimanual block-stacking, EEF pose action space with a 6D
+    # rotation representation (see unitree_eef6d_policy.py). Same recipe as
+    # pi05_g1_eef; the ONLY difference is quat->6D on model in/out, which
+    # removes the quaternion double-cover ambiguity that made the left-arm
+    # orientation the worst-tracked channel. On-disk data stays 16-dim quat.
+    # Trains on stack-merged-eef (stack-cube-eef + stack-the-cube-v2-eef merged,
+    # both relabeled to the color-stacking prompt).
+      name="pi05_g1_eef6d",
+      model=pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=48,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ),
+      data=LeRobotUnitreeG1EEF6DDataConfig(
+        repo_id="stack-merged-eef",
+        base_config=DataConfig(
+            local_root=pathlib.Path("/home/ur3-exp/unitree/data"),
+            prompt_from_task=True,
+        ),
+      ),
+      weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+      batch_size=32,
+      num_workers=8,
+      num_train_steps=20000,
+      save_interval=4000,
+      log_interval=100,
+      keep_period=2000,
+      wandb_enabled=True,
+      lr_schedule=_optimizer.CosineDecaySchedule(
+        warmup_steps=500,
+        peak_lr=2.5e-5,
+        decay_steps=15_000,
+        decay_lr=2.5e-6,
+      ),
+      optimizer=_optimizer.AdamW(
+        b1=0.9,
+        b2=0.95,
+        eps=1e-8,
+        weight_decay=1e-4,
+        clip_gradient_norm=1.0,
+      ),
+      freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ).get_freeze_filter(),
+      ema_decay=0.99,
+      eval_interval = 500,
+      eval_episodes = 5,
+      eval_stride= 20,
+      eval_max_frames = None,
+      eval_data_path = "/home/ur3-exp/unitree/data/stack-cube-new-eval-eef",
+    ),
+
+    TrainConfig(
+    # Same as pi05_g1_eef6d, but the two EEF position triplets are DELTA actions
+    # (relative to the current EEF pose); rotations (6D) and grippers stay
+    # absolute. Highest-leverage change for spatial generalization when object /
+    # robot positions vary between collection and deployment (delta trajectories
+    # are largely independent of absolute start pose). Needs its OWN norm_stats
+    # (delta action distribution differs) -> distinct config name / assets dir.
+    # Client contract is unchanged: AbsoluteActions re-adds the current pose, so
+    # the returned actions are still absolute quaternion poses.
+      name="pi05_g1_eef6d_delta",
+      model=pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=48,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ),
+      data=LeRobotUnitreeG1EEF6DDataConfig(
+        repo_id="stack-merged-eef",
+        delta_position_actions=True,
+        base_config=DataConfig(
+            local_root=pathlib.Path("/home/ur3-exp/unitree/data"),
+            prompt_from_task=True,
+        ),
+      ),
+      weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+      batch_size=32,
+      num_workers=8,
+      num_train_steps=20000,
+      save_interval=4000,
+      log_interval=100,
+      keep_period=2000,
+      wandb_enabled=True,
+      lr_schedule=_optimizer.CosineDecaySchedule(
+        warmup_steps=500,
+        peak_lr=2.5e-5,
+        decay_steps=15_000,
+        decay_lr=2.5e-6,
+      ),
+      optimizer=_optimizer.AdamW(
+        b1=0.9,
+        b2=0.95,
+        eps=1e-8,
+        weight_decay=1e-4,
+        clip_gradient_norm=1.0,
+      ),
+      freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ).get_freeze_filter(),
+      ema_decay=0.99,
+      eval_interval = 500,
+      eval_episodes = 5,
+      eval_stride= 20,
+      eval_max_frames = None,
+      eval_data_path = "/home/ur3-exp/unitree/data/stack-cube-eval-eef",
+    ),
+
+    TrainConfig(
+    # VARIABLE-ISOLATION configs: identical recipe to pi05_g1_eef6d(_delta) but
+    # trained on stack-cube-eef ONLY (95 eps, correct stacking prompt), NOT the
+    # merged set. Use these to disentangle whether the "grasp-then-oscillate"
+    # regression is caused by (a) the added stack-the-cube-v2 data (conflicting
+    # placement height) or (b) the delta representation:
+    #   pi05_g1_eef6d_scube        : 6D absolute, stack-cube-eef only
+    #   pi05_g1_eef6d_delta_scube  : 6D + position-delta, stack-cube-eef only
+    # If _scube places cleanly and the merged model does not -> v2 is the cause.
+    # If _delta_scube oscillates but _scube does not -> delta feedback is the cause.
+      name="pi05_g1_eef6d_scube",
+      model=pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=48,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ),
+      data=LeRobotUnitreeG1EEF6DDataConfig(
+        repo_id="stack-cube-eef",
+        base_config=DataConfig(
+            local_root=pathlib.Path("/home/ur3-exp/unitree/data"),
+            prompt_from_task=True,
+        ),
+      ),
+      weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+      batch_size=32,
+      num_workers=8,
+      num_train_steps=20000,
+      save_interval=4000,
+      log_interval=100,
+      keep_period=2000,
+      wandb_enabled=True,
+      lr_schedule=_optimizer.CosineDecaySchedule(
+        warmup_steps=500,
+        peak_lr=2.5e-5,
+        decay_steps=15_000,
+        decay_lr=2.5e-6,
+      ),
+      optimizer=_optimizer.AdamW(
+        b1=0.9,
+        b2=0.95,
+        eps=1e-8,
+        weight_decay=1e-4,
+        clip_gradient_norm=1.0,
+      ),
+      freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ).get_freeze_filter(),
+      ema_decay=0.99,
+      eval_interval = 500,
+      eval_episodes = 5,
+      eval_stride= 20,
+      eval_max_frames = None,
+      eval_data_path = "/home/ur3-exp/unitree/data/stack-cube-eval-eef",
+    ),
+
+    TrainConfig(
+    # 6D + position-delta, stack-cube-eef ONLY. See pi05_g1_eef6d_scube header.
+      name="pi05_g1_eef6d_delta_scube",
+      model=pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=48,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ),
+      data=LeRobotUnitreeG1EEF6DDataConfig(
+        repo_id="stack-cube-eef",
+        delta_position_actions=True,
+        base_config=DataConfig(
+            local_root=pathlib.Path("/home/ur3-exp/unitree/data"),
+            prompt_from_task=True,
+        ),
+      ),
+      weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+      batch_size=32,
+      num_workers=8,
+      num_train_steps=20000,
+      save_interval=4000,
+      log_interval=100,
+      keep_period=2000,
+      wandb_enabled=True,
+      lr_schedule=_optimizer.CosineDecaySchedule(
+        warmup_steps=500,
+        peak_lr=2.5e-5,
+        decay_steps=15_000,
+        decay_lr=2.5e-6,
+      ),
+      optimizer=_optimizer.AdamW(
+        b1=0.9,
+        b2=0.95,
+        eps=1e-8,
+        weight_decay=1e-4,
+        clip_gradient_norm=1.0,
+      ),
+      freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ).get_freeze_filter(),
+      ema_decay=0.99,
+      eval_interval = 500,
+      eval_episodes = 5,
+      eval_stride= 20,
+      eval_max_frames = None,
+      eval_data_path = "/home/ur3-exp/unitree/data/stack-cube-eval-eef",
+    ),
+
+
     TrainConfig(
      # This config is for fine-tuning pi05-base-mutitask on a custom multitask dataset.
      # Here, we use LeRobot data format (like for all other fine-tuning examples)

@@ -2,7 +2,7 @@
 compare its predicted action chunk against the demo (ground-truth) actions.
 
 Example:
-    python scripts/eval.py --config pi05_unitree_g1 \
+    CUDA_VISIBLE_DEVICES=7 uv run scripts/eval.py --config pi05_unitree_g1 \
         --checkpoint checkpoints/pi05_unitree_g1/exp/16000 \
         --episode 0 --out_dir eval_out
 """

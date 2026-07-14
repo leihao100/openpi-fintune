@@ -23,6 +23,25 @@ Tested target:
 Gripper convention assumed:
   action 0 -> 1  =  OPEN
   action 1 -> 0  =  CLOSE
+
+Multi-arm / multi-camera:
+  - Video keys are auto-detected from features (dtype == "video"), so any
+    number of cameras (e.g. 3) is handled with no code changes.
+  - Idle detection treats EVERY non-gripper action dim as a motion dim and
+    every gripper (configurable list of indices) independently. A frame is
+    idle only if the arm is not being commanded to move AND all grippers are
+    static. Gripper events / close-protection take the union across grippers.
+  - The arm-motion signal depends on what `action` means (--motion-idle-mode):
+        target : action is an ABSOLUTE target position (controller setpoint);
+                 idle when the target is unchanged frame-to-frame.   [default]
+        delta  : action dims are deltas/velocities; idle when ~0.
+  - Default dual-arm UR3 action layout (16-dim):
+        [0..6]  left  arm eef
+        [7..13] right arm eef
+        [14]    left  gripper
+        [15]    right gripper
+    observation.state uses the SAME 16-dim layout, so the gripper indices
+    match: --gripper-act-idx 14,15 and --gripper-obs-idx 14,15 (both default).
 """
  
 import argparse
@@ -43,6 +62,13 @@ import lerobot.datasets.lerobot_dataset as _lr_mod
  
 NUMERIC_DTYPES = {"float32", "float64", "int32", "int64", "bool",
                   "uint8", "uint16", "uint32", "uint64", "int8", "int16"}
+
+
+def _parse_idx_list(s):
+    """Parse a comma-separated index list, e.g. '14,15' -> [14, 15]."""
+    if isinstance(s, (list, tuple)):
+        return [int(x) for x in s]
+    return [int(x) for x in str(s).split(",") if str(x).strip() != ""]
  
  
 # ============================================================
@@ -143,12 +169,47 @@ def episode_paths(src_root: Path, ep_idx: int, chunks_size: int, video_keys):
 # Idle detection
 # ============================================================
  
+def motion_signal(actions, motion_idxs, motion_mode):
+    """Per-frame 'how much the arm is being commanded to move', for the
+    non-gripper action dims.
+
+    motion_mode:
+      "target" -> action is an ABSOLUTE target position (controller setpoint).
+                  A frame is moving iff the target changes vs the previous
+                  frame, so the signal is |action[t] - action[t-1]|.
+      "delta"  -> action dims are already deltas/velocities, so the signal is
+                  |action[t]| directly (original single-arm behavior).
+    """
+    motion = actions[:, motion_idxs]
+    if motion_mode == "delta":
+        return np.abs(motion)
+    # "target": temporal difference; frame 0 inherits frame 1's value.
+    d = np.abs(np.diff(motion, axis=0))
+    if len(d) == 0:                      # T <= 1
+        return np.zeros_like(motion)
+    return np.vstack([d[:1], d])
+
+
 def find_idle_mask(actions, obs_states, threshold,
-                   gripper_act_idx, gripper_obs_idx):
-    vel_idle = np.all(np.abs(actions[:, :6]) < threshold, axis=1)
-    gripper_action = actions[:, gripper_act_idx]
-    gripper_state = obs_states[:, gripper_obs_idx]
-    gripper_idle = np.abs(gripper_action - gripper_state) < threshold
+                   gripper_act_idxs, gripper_obs_idxs, motion_mode="target"):
+    """Idle = arm not being commanded to move AND every gripper static.
+
+    - Arm: motion_signal(...) < threshold on every non-gripper dim. For
+      absolute target positions (motion_mode="target") this means the
+      commanded target is not changing frame-to-frame.
+    - Gripper: |gripper_action - gripper_state| < threshold per gripper
+      (target reached and held). Correct for absolute gripper targets too.
+
+    Works for any number of arms/grippers.
+    """
+    gripper_set = set(gripper_act_idxs)
+    motion_idxs = [i for i in range(actions.shape[1]) if i not in gripper_set]
+    sig = motion_signal(actions, motion_idxs, motion_mode)
+    vel_idle = np.all(sig < threshold, axis=1)
+
+    gripper_idle = np.ones(actions.shape[0], dtype=bool)
+    for a_idx, o_idx in zip(gripper_act_idxs, gripper_obs_idxs):
+        gripper_idle &= np.abs(actions[:, a_idx] - obs_states[:, o_idx]) < threshold
     return vel_idle & gripper_idle
  
  
@@ -178,21 +239,32 @@ def classify_segments(idle_segments, n_frames):
     return out
  
  
-def map_gripper_events_to_idles(actions, gripper_act_idx, idle_segments,
+def gripper_transitions(actions, gripper_act_idxs):
+    """Collect (frame, event) across all grippers, sorted by frame.
+    Convention: 1 = open, 0 = close. Use post-transition value."""
+    events = []
+    for a_idx in gripper_act_idxs:
+        g = actions[:, a_idx]
+        diffs = np.abs(np.diff(g))
+        for t in np.where(diffs > 0.4)[0]:
+            post = g[t + 1] if (t + 1) < len(g) else g[t]
+            events.append((int(t), "open" if post > 0.5 else "close"))
+    events.sort(key=lambda x: x[0])
+    return events
+
+
+def map_gripper_events_to_idles(actions, gripper_act_idxs, idle_segments,
                                 n_frames, max_gap_frames=30):
-    """Convention: 1 = open, 0 = close. Use post-transition value."""
-    g = actions[:, gripper_act_idx]
-    diffs = np.abs(np.diff(g))
-    transitions = np.where(diffs > 0.4)[0]
+    """Label each middle idle segment with the gripper event (open/close) of
+    ANY gripper that transitioned shortly before it."""
+    events = gripper_transitions(actions, gripper_act_idxs)
  
     classified = classify_segments(idle_segments, n_frames)
     mid_segs = [(i, s, e) for i, (kind, s, e) in enumerate(classified)
                 if kind == "middle"]
  
     labels = {}
-    for t in transitions:
-        post = g[t + 1] if (t + 1) < len(g) else g[t]
-        event = "open" if post > 0.5 else "close"
+    for t, event in events:
         for seg_i, s, e in mid_segs:
             if seg_i in labels:
                 continue
@@ -202,28 +274,25 @@ def map_gripper_events_to_idles(actions, gripper_act_idx, idle_segments,
     return labels
  
  
-def compute_keep_mask(n_frames, idle_mask, actions, gripper_act_idx,
+def compute_keep_mask(n_frames, idle_mask, actions, gripper_act_idxs,
                       start_keep, end_keep, mid_keep, min_idle_len,
                       fps, close_protect_sec=2.0, max_gap_frames=30):
     keep = np.ones(n_frames, dtype=bool)
     info = []
 
-    # Close protection: keep all idle within 2s after any close transition (1->0)
+    # Close protection: keep all idle within 2s after ANY gripper's close
+    # transition (1->0), across all grippers.
     close_protect_frames = int(round(fps * close_protect_sec))
-    g = actions[:, gripper_act_idx]
-    diffs = np.abs(np.diff(g))
-    transitions = np.where(diffs > 0.4)[0]
     close_protected = np.zeros(n_frames, dtype=bool)
-    for t in transitions:
-        post = g[t + 1] if (t + 1) < len(g) else g[t]
-        if post < 0.5:  # close: action went 1->0, post value ~0
+    for t, event in gripper_transitions(actions, gripper_act_idxs):
+        if event == "close":  # action went 1->0, post value ~0
             prot_end = min(n_frames, t + 1 + close_protect_frames)
             close_protected[t + 1: prot_end] = True
 
     idle_segments = find_contiguous_segments(idle_mask)
     classified = classify_segments(idle_segments, n_frames)
     gripper_labels = map_gripper_events_to_idles(
-        actions, gripper_act_idx, idle_segments, n_frames, max_gap_frames)
+        actions, gripper_act_idxs, idle_segments, n_frames, max_gap_frames)
 
     for seg_i, (kind, s, e) in enumerate(classified):
         seg_len = e - s
@@ -268,6 +337,51 @@ def compute_keep_mask(n_frames, idle_mask, actions, gripper_act_idx,
 # Video decode (PTS-ordered, batch)
 # ============================================================
  
+def find_last_release(actions, gripper_act_idxs):
+    """Frame index of the FINAL gripper release (closed->open) across all
+    grippers, or None if none is detected.
+
+    A release = the manipulating gripper opening after a grasp (final block
+    placed). The idle arm's gripper never actuates, so taking the last release
+    over all grippers isolates the last real placement regardless of which arm
+    manipulated in this episode."""
+    last = None
+    for gi in gripper_act_idxs:
+        g = np.asarray(actions[:, gi])
+        lo, hi = float(g.min()), float(g.max())
+        if hi - lo < 0.4:               # this gripper never actuates this episode
+            continue
+        mid = 0.5 * (lo + hi)
+        closed = g < mid
+        rel = np.where(closed[:-1] & ~closed[1:])[0] + 1   # closed -> open
+        if len(rel):
+            last = int(rel[-1]) if last is None else max(last, int(rel[-1]))
+    return last
+
+
+def compute_tail_keep_mask(n_frames, actions, gripper_act_idxs, margin):
+    """Keep [0 : last_release + margin]; drop the post-placement retract/wobble.
+
+    The demos keep teleoperating (arm retract, hand-off jitter) for a while
+    after the final block is released — that trailing motion is task-irrelevant
+    and is actively harmful to learn (it is real motion, so the idle trimmer
+    never catches it). Truncating right after the final release + a short settle
+    margin removes it. Falls back to keeping the whole episode if no release is
+    detected."""
+    keep = np.ones(n_frames, dtype=bool)
+    last = find_last_release(actions, gripper_act_idxs)
+    if last is None:
+        return keep, [{"kind": "no-release", "start": 0, "end": n_frames,
+                       "seg_len": n_frames, "dropped": 0}]
+    cut = min(last + margin, n_frames)
+    info = []
+    if cut < n_frames:
+        keep[cut:] = False
+        info.append({"kind": "tail", "start": cut, "end": n_frames,
+                     "seg_len": n_frames - cut, "dropped": n_frames - cut})
+    return keep, info
+
+
 def decode_episode_video(video_path: Path) -> list:
     """Decode all frames as HWC uint8 RGB, sorted by PTS (display order).
  
@@ -355,32 +469,49 @@ def analyze_and_rebuild(args):
         obs_states = np.stack(df["observation.state"].values)
  
         if ep_idx == 0:
-            g = actions[:, args.gripper_act_idx]
-            n_trans = int((np.abs(np.diff(g)) > 0.4).sum())
+            gripper_set = set(args.gripper_act_idxs)
+            motion_idxs = [i for i in range(actions.shape[1])
+                           if i not in gripper_set]
             print(f"\n[sanity] episode 0 stats:")
             print(f"  action shape:    {actions.shape}")
-            print(f"  |action[:,:6]| median per dim: "
-                  f"{np.round(np.median(np.abs(actions[:, :6]), axis=0), 5)}")
+            print(f"  gripper act idxs: {args.gripper_act_idxs}  "
+                  f"obs idxs: {args.gripper_obs_idxs}")
+            print(f"  motion (non-gripper) action idxs: {motion_idxs}")
+            print(f"  motion-idle-mode: {args.motion_idle_mode}")
+            sig = motion_signal(actions, motion_idxs, args.motion_idle_mode)
+            print(f"  motion signal median per dim: "
+                  f"{np.round(np.median(sig, axis=0), 5)}")
+            print(f"  frames with all motion < {args.threshold}: "
+                  f"{int(np.all(sig < args.threshold, axis=1).sum())}/{len(actions)}")
             print(f"  action min:      {np.round(actions.min(0), 4)}")
             print(f"  action max:      {np.round(actions.max(0), 4)}")
             print(f"  obs_state shape: {obs_states.shape}")
-            print(f"  obs_state[:,{args.gripper_obs_idx}] range: "
-                  f"[{obs_states[:, args.gripper_obs_idx].min():.4f}, "
-                  f"{obs_states[:, args.gripper_obs_idx].max():.4f}]")
-            print(f"  action[:,{args.gripper_act_idx}] range: "
-                  f"[{actions[:, args.gripper_act_idx].min():.4f}, "
-                  f"{actions[:, args.gripper_act_idx].max():.4f}]")
-            print(f"  gripper transitions in ep0: {n_trans}")
+            for a_idx, o_idx in zip(args.gripper_act_idxs, args.gripper_obs_idxs):
+                g = actions[:, a_idx]
+                n_trans = int((np.abs(np.diff(g)) > 0.4).sum())
+                print(f"  gripper act[{a_idx}] range "
+                      f"[{g.min():.4f}, {g.max():.4f}] vs "
+                      f"obs[{o_idx}] range "
+                      f"[{obs_states[:, o_idx].min():.4f}, "
+                      f"{obs_states[:, o_idx].max():.4f}]  "
+                      f"transitions={n_trans}")
             print(f"  convention: 0->1 OPEN, 1->0 CLOSE\n")
- 
-        idle_mask = find_idle_mask(actions, obs_states, args.threshold,
-                                   args.gripper_act_idx, args.gripper_obs_idx)
-        keep, info = compute_keep_mask(
-            ep_length, idle_mask, actions, args.gripper_act_idx,
-            args.start_keep, args.end_keep, args.mid_keep, args.min_idle_len,
-            fps=src_ds.fps, max_gap_frames=int(round(src_ds.fps)))
+
+        if args.mode == "tail":
+            margin = int(round(args.tail_margin_s * src_ds.fps))
+            keep, info = compute_tail_keep_mask(
+                ep_length, actions, args.gripper_act_idxs, margin)
+            idle_n = 0
+        else:
+            idle_mask = find_idle_mask(actions, obs_states, args.threshold,
+                                       args.gripper_act_idxs, args.gripper_obs_idxs,
+                                       motion_mode=args.motion_idle_mode)
+            keep, info = compute_keep_mask(
+                ep_length, idle_mask, actions, args.gripper_act_idxs,
+                args.start_keep, args.end_keep, args.mid_keep, args.min_idle_len,
+                fps=src_ds.fps, max_gap_frames=int(round(src_ds.fps)))
+            idle_n = int(idle_mask.sum())
         n_after = int(keep.sum())
-        idle_n = int(idle_mask.sum())
  
         plan.append((ep_idx, ep_from, ep_to, keep, info))
         total_before += ep_length
@@ -503,9 +634,28 @@ def main():
     p.add_argument("--dst-repo-id", default="local/trimmed")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--mode", choices=["idle", "tail"], default="idle",
+                   help="'idle' (default): drop static idle segments. "
+                        "'tail': truncate each episode after the FINAL gripper "
+                        "release + margin, removing the post-placement retract/"
+                        "wobble that the idle trimmer cannot catch.")
+    p.add_argument("--tail-margin-s", type=float, default=0.5,
+                   help="[tail mode] seconds to keep after the final release "
+                        "(lets the block settle / gripper clear) before cutting.")
     p.add_argument("--threshold", type=float, default=0.01)
-    p.add_argument("--gripper-act-idx", type=int, default=6)
-    p.add_argument("--gripper-obs-idx", type=int, default=9)
+    p.add_argument("--motion-idle-mode", choices=["target", "delta"],
+                   default="target",
+                   help="'target' (default): action is an absolute target "
+                        "position, idle = target unchanged frame-to-frame. "
+                        "'delta': action dims are deltas/velocities, idle = "
+                        "magnitude near zero (original single-arm behavior).")
+    p.add_argument("--gripper-act-idx", default="14,15",
+                   help="Comma-separated gripper indices in the action vector "
+                        "(dual-arm UR3 default: 14,15 = left,right).")
+    p.add_argument("--gripper-obs-idx", default="14,15",
+                   help="Comma-separated gripper indices in observation.state, "
+                        "matched 1:1 with --gripper-act-idx. Dual-arm UR3 "
+                        "default 14,15 (state is same layout as action).")
     p.add_argument("--start-keep", type=int, default=5)
     p.add_argument("--end-keep", type=int, default=10)
     p.add_argument("--mid-keep", type=int, default=0)
@@ -516,7 +666,14 @@ def main():
  
     if not args.dry_run and args.dst is None:
         p.error("--dst is required unless --dry-run is set")
- 
+
+    args.gripper_act_idxs = _parse_idx_list(args.gripper_act_idx)
+    args.gripper_obs_idxs = _parse_idx_list(args.gripper_obs_idx)
+    if len(args.gripper_act_idxs) != len(args.gripper_obs_idxs):
+        p.error("--gripper-act-idx and --gripper-obs-idx must have the same "
+                f"number of entries (got {args.gripper_act_idxs} vs "
+                f"{args.gripper_obs_idxs})")
+
     analyze_and_rebuild(args)
  
  
