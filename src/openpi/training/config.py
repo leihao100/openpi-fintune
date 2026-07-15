@@ -405,7 +405,19 @@ class LeRobotUnitreeG1EEFDataConfig(DataConfigFactory):
     """Unitree G1 Dex1 bimanual EEF-space dataset config.
     16-dim: L_eef xyz+quat(7) + R_eef xyz+quat(7) + L_grip(1) + R_grip(1),
     pelvis frame, quaternion order (qx, qy, qz, qw).
-    Three cameras: left_high (base), left_wrist, right_wrist."""
+    Three cameras: left_high (base), left_wrist, right_wrist.
+
+    If `delta_position_actions` is True, the two EEF POSITION triplets (dims
+    0:3 and 7:10 of the 16-dim quaternion layout) are converted to deltas
+    relative to the current state before the model, and added back after.
+    Quaternions and grippers stay absolute (delta of a quaternion is not
+    meaningful). Same spatial-generalization rationale as the 6D delta config;
+    the on-robot client contract is unchanged (AbsoluteActions re-adds the
+    current pose, so returned actions are still absolute quaternion poses)."""
+
+    # Delta the L/R EEF position triplets (quaternions/grippers stay absolute).
+    # Needs its own norm_stats -> use a distinct config name / assets dir.
+    delta_position_actions: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -423,10 +435,15 @@ class LeRobotUnitreeG1EEFDataConfig(DataConfigFactory):
                 )
             ]
         )
-        data_transforms = _transforms.Group(
-            inputs=[unitree_eef_policy.UnitreeG1EEFInputs(model_type=model_config.model_type)],
-            outputs=[unitree_eef_policy.UnitreeG1EEFOutputs()],
-        )
+        input_transforms = [unitree_eef_policy.UnitreeG1EEFInputs(model_type=model_config.model_type)]
+        output_transforms = [unitree_eef_policy.UnitreeG1EEFOutputs()]
+        if self.delta_position_actions:
+            # 16-dim quat layout: [Lpos(3) | Lquat(4) | Rpos(3) | Rquat(4) | Lgrip | Rgrip].
+            # Delta only the two position triplets; quaternions and grippers absolute.
+            pos_delta_mask = _transforms.make_bool_mask(3, -4, 3, -4, -2)
+            input_transforms.append(_transforms.DeltaActions(pos_delta_mask))
+            output_transforms.insert(0, _transforms.AbsoluteActions(pos_delta_mask))
+        data_transforms = _transforms.Group(inputs=input_transforms, outputs=output_transforms)
         model_transforms = ModelTransformFactory()(model_config)
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -461,6 +478,13 @@ class LeRobotUnitreeG1EEF6DDataConfig(DataConfigFactory):
     # stay absolute). Requires its own norm_stats (delta action distribution
     # differs from absolute), so use a distinct config name / assets dir.
     delta_position_actions: bool = False
+    # When delta_position_actions is True, restrict the delta to the HORIZONTAL
+    # (x, y) axes and keep z ABSOLUTE. Rationale: delta helps the relative
+    # approach/grasp (x, y) and is robust to absolute-frame bias, but on z it
+    # loses the absolute-height reference and accumulates drift — bad for
+    # stacking to a fixed top-of-stack height. So delta x,y (generalize the
+    # approach) + absolute z (precise placement height) is the best of both.
+    delta_horizontal_only: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -481,9 +505,13 @@ class LeRobotUnitreeG1EEF6DDataConfig(DataConfigFactory):
         input_transforms = [unitree_eef6d_policy.UnitreeG1EEF6DInputs(model_type=model_config.model_type)]
         output_transforms = [unitree_eef6d_policy.UnitreeG1EEF6DOutputs()]
         if self.delta_position_actions:
-            # 20-dim 6D layout: [Lpos(3) | Lrot6d(6) | Rpos(3) | Rrot6d(6) | Lgrip | Rgrip].
-            # Delta only the two position triplets; rotation-6D and grippers absolute.
-            pos_delta_mask = _transforms.make_bool_mask(3, -6, 3, -6, -2)
+            # 20-dim 6D layout: [Lx Ly Lz | Lrot6d(6) | Rx Ry Rz | Rrot6d(6) | Lgrip | Rgrip].
+            if self.delta_horizontal_only:
+                # delta x,y only; z, rotation-6D, grippers absolute.
+                pos_delta_mask = _transforms.make_bool_mask(2, -1, -6, 2, -1, -6, -2)
+            else:
+                # delta the full position triplets; rotation-6D and grippers absolute.
+                pos_delta_mask = _transforms.make_bool_mask(3, -6, 3, -6, -2)
             # DeltaActions runs AFTER the quat->6D input transform (needs the 20-dim
             # state+actions); AbsoluteActions runs BEFORE the 6D->quat output transform
             # (must act on the 20-dim layout the mask indexes).
@@ -1189,6 +1217,123 @@ _CONFIGS = [
       eval_stride= 20,
       eval_max_frames = None,
       eval_data_path = "/home/ur3-exp/unitree/data/stack-cube-eval-eef",
+    ),
+
+    TrainConfig(
+    # 7D (quaternion) EEF representation + position-delta, stack-cube-eef ONLY.
+    # Same as pi05_g1_eef6d_delta_scube but keeps the ORIGINAL 16-dim quaternion
+    # action space (L/R xyz+quat + grippers) instead of 6D rotation. Position
+    # triplets are delta; quaternions and grippers stay absolute. Use it to
+    # isolate the effect of the delta representation on your known-good 7D setup,
+    # and to compare 7D-delta vs 6D-delta head to head.
+      name="pi05_g1_eef_delta_scube",
+      model=pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=48,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ),
+      data=LeRobotUnitreeG1EEFDataConfig(
+        repo_id="stack-cube-eef",
+        delta_position_actions=True,
+        base_config=DataConfig(
+            local_root=pathlib.Path("/home/ur3-exp/unitree/data"),
+            prompt_from_task=True,
+        ),
+      ),
+      weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+      batch_size=32,
+      num_workers=8,
+      num_train_steps=20000,
+      save_interval=4000,
+      log_interval=100,
+      keep_period=2000,
+      wandb_enabled=True,
+      lr_schedule=_optimizer.CosineDecaySchedule(
+        warmup_steps=500,
+        peak_lr=2.5e-5,
+        decay_steps=15_000,
+        decay_lr=2.5e-6,
+      ),
+      optimizer=_optimizer.AdamW(
+        b1=0.9,
+        b2=0.95,
+        eps=1e-8,
+        weight_decay=1e-4,
+        clip_gradient_norm=1.0,
+      ),
+      freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ).get_freeze_filter(),
+      ema_decay=0.99,
+      eval_interval = 500,
+      eval_episodes = 5,
+      eval_stride= 20,
+      eval_max_frames = None,
+      eval_data_path = "/home/ur3-exp/unitree/data/stack-cube-new-eval-eef",
+    ),
+
+    TrainConfig(
+    # MIXED action space: 6D, position-delta on x,y only, z/rotation/grippers
+    # ABSOLUTE. Motivated by the empirical split observed on the robot:
+    #   - full-delta improved GRASP precision (relative approach on x,y, robust
+    #     to absolute-frame bias, closed-loop convergence) but
+    #   - full-delta learned HEIGHT poorly (delta loses the absolute-z reference
+    #     and accumulates drift -> bad for stacking to a fixed top-of-stack z).
+    # Delta x,y keeps the grasp benefit; absolute z restores placement-height
+    # precision. Rotation (6D) and grippers stay absolute. stack-cube-eef only.
+      name="pi05_g1_eef6d_deltaxy_scube",
+      model=pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=48,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ),
+      data=LeRobotUnitreeG1EEF6DDataConfig(
+        repo_id="stack-cube-eef",
+        delta_position_actions=True,
+        delta_horizontal_only=True,
+        base_config=DataConfig(
+            local_root=pathlib.Path("/home/ur3-exp/unitree/data"),
+            prompt_from_task=True,
+        ),
+      ),
+      weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+      batch_size=32,
+      num_workers=8,
+      num_train_steps=20000,
+      save_interval=4000,
+      log_interval=100,
+      keep_period=2000,
+      wandb_enabled=True,
+      lr_schedule=_optimizer.CosineDecaySchedule(
+        warmup_steps=500,
+        peak_lr=2.5e-5,
+        decay_steps=15_000,
+        decay_lr=2.5e-6,
+      ),
+      optimizer=_optimizer.AdamW(
+        b1=0.9,
+        b2=0.95,
+        eps=1e-8,
+        weight_decay=1e-4,
+        clip_gradient_norm=1.0,
+      ),
+      freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+      ).get_freeze_filter(),
+      ema_decay=0.99,
+      eval_interval = 500,
+      eval_episodes = 5,
+      eval_stride= 20,
+      eval_max_frames = None,
+      eval_data_path = "/home/ur3-exp/unitree/data/stack-cube-new-eval-eef",
     ),
 
 
