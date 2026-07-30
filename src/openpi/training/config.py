@@ -18,6 +18,7 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.b601_policy as b601_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.ur3_policy as ur3_policy
@@ -603,6 +604,52 @@ class OldLeRobotUR3MergedDataConfig(DataConfigFactory):
             action_sequence_keys=("action",),  # ← 单数，匹配数据集
         )
 
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotB601DataConfig(DataConfigFactory):
+    """Data config for fine-tuning on a Seeed B601 (single-arm follower) LeRobot v2.1 dataset.
+
+    The B601 dataset stores a 7-dim absolute-joint-position state/action vector (degrees) and only two
+    cameras (top, wrist); b601_policy zero-fills and masks the third view. Actions are *absolute* joint
+    positions, so we do NOT apply a delta transform.
+    """
+
+    # Injected as the prompt for every sample. Leave None to take the prompt from the dataset's tasks.jsonl.
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Remap raw LeRobot column names to the flat keys expected by B601Inputs (and by the inference client).
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/top": "observation.images.top",
+                        "observation/wrist": "observation.images.wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        # PromptFromLeRobotTask runs before repack and repack drops unlisted keys, so the
+                        # prompt has to be carried through explicitly when prompt_from_task is set.
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[b601_policy.B601Inputs(model_type=model_config.model_type)],
+            outputs=[b601_policy.B601Outputs()],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1333,7 +1380,96 @@ _CONFIGS = [
       eval_episodes = 5,
       eval_stride= 20,
       eval_max_frames = None,
-      eval_data_path = "/home/ur3-exp/unitree/data/stack-cube-new-eval-eef",
+      eval_data_path = "/shared/user64/workspace/yuhao/pi/data/stack-cube-eef-eval",
+    ),
+    #
+    # Fine-tuning Seeed B601 configs.
+    #
+    # Single-arm 7-dim pick-and-place, delivered as LeRobot v2.1 by the collection party. Only two
+    # cameras, so b601_policy zero-fills and masks the right wrist view. The action expert is adapted
+    # with LoRA while PaliGemma (vision + LLM) is fully fine-tuned; note that get_freeze_filter only
+    # matches ".*llm.*", so the SigLIP tower stays trainable.
+    #
+    # Actions are absolute joint positions in degrees, and observation.state does NOT share the
+    # action's coordinate convention: shoulder_pan, shoulder_lift, wrist_roll and gripper are
+    # sign-flipped, and the gripper uses a different unit (state spans [-270, 0], action [0, 57]).
+    # The state (follower) -> action (leader) conversion is NOT implemented here; a real-robot
+    # client has to do it. State normalization is minmax, so a state outside the training range
+    # saturates pi0.5's 256-bin state discretization.
+    TrainConfig(
+        name="pi05_b601_pick_red_cube",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,  # 30 fps -> ~1s action chunk
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotB601DataConfig(
+            # Keep the slash: asset_id defaults to repo_id, and the delivered checkpoints bundle their
+            # norm stats under assets/b601/pick_red_cube_v1/. Renaming this breaks checkpoint loading.
+            repo_id="b601/pick_red_cube_v1",
+            base_config=DataConfig(
+                local_root=pathlib.Path("/shared/user64/workspace/yuhao/pi/data"),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+        batch_size=32,
+        ema_decay=None,  # EMA is turned off for LoRA finetuning.
+    ),
+    # Same robot and data pipeline as above, but with the capacity split the other way round: LoRA on
+    # the Gemma-2B LLM only, so its 2.5B of pretrained language weights stay frozen, while the action
+    # expert -- the one part that has to learn B601's novel action space -- trains in full. The SigLIP
+    # tower also trains in full; openpi has no mechanism to freeze or LoRA it (get_freeze_filter only
+    # matches ".*llm.*"). This is the branch get_freeze_filter documents as "If only freeze gemma
+    # params, exclude action expert params".
+    #
+    # Trainable 872.8M of 3.381B (25.8%): SigLIP 414.8M + action expert 427.9M + LLM LoRA 27.9M +
+    # flow heads 2.2M. Frozen: the 2508.5M Gemma-2B base.
+    #
+    # Registered as a separate config rather than editing the one above because the two have different
+    # parameter trees -- reusing the name would make the other's checkpoints unloadable. Norm stats are
+    # shared via AssetsConfig so both configs read one file.
+    TrainConfig(
+        name="pi05_b601_pick_red_cube_llm_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,  # 30 fps -> ~1s action chunk
+            paligemma_variant="gemma_2b_lora",
+            # action_expert_variant stays at the gemma_300m default: full fine-tuning.
+        ),
+        data=LeRobotB601DataConfig(
+            repo_id="b601/pick_red_cube_v1",
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_b601_pick_red_cube",
+                asset_id="b601/pick_red_cube_v1",
+            ),
+            base_config=DataConfig(
+                local_root=pathlib.Path("/shared/user64/workspace/yuhao/pi/data"),
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+        batch_size=32,
+        # The default of 2 starves the GPUs: each sample decodes two AV1 streams, and splitting a
+        # batch of 32 over four devices makes each step fast enough that the loader becomes the
+        # bottleneck (observed ~30% idle time on all four GPUs).
+        num_workers=8,
+        # Kept at None so this run differs from pi05_b601_pick_red_cube in the capacity split alone.
+        ema_decay=None,
     ),
 
 
